@@ -272,7 +272,7 @@ print(statio_list_varfi)
 
 # For all series which are not I(0), we perform a differenciation at first order
 df_fi_transfo: pd.DataFrame = df_fi.copy()
-for i in range(1, df_fi.shape[1]):
+for i in range(df_fi.shape[1]):
     # Retrieve the feature
     feature = df_fi.iloc[:, i]
     integration_type:str = statio_list_varfi[i]
