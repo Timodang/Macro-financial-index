@@ -1911,7 +1911,7 @@ class RollingGroupLasso:
     
     where G_g is group g and ||β_g||₂ is the L2 norm of coefficients in group g.
     
-    This encourages sparsity at the GROUP level (not individual variables).
+    This encourages sparsity at the group level (not individual variables).
     """
     
     def __init__(

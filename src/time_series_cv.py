@@ -83,7 +83,7 @@ class DependentTimeSeriesCV:
         if test_size == -1:
             # If both test_size and min_train_size are None:
             # choose a simple heuristic: initial train = n_samples // (n_splits + 1),
-            # remaining split equally across folds as test blocks.
+            # remaining split equally across folds as test blocks*.
             min_train = n_samples // (self.n_splits + 1)
             if min_train < 1:
                 raise ValueError("Not enough samples to infer min_train_size.")

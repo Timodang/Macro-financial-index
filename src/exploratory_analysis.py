@@ -49,7 +49,7 @@ def plot_top_corrs(
     threshold: float = 0.3
 ) -> None:
     """
-    Plot the strongest positive and negative correlations as a horizontal bar chart.
+    Plot the strongest positive & negative correlations as a horizontal bar chart.
     
     :param corrs: Series of correlations indexed by variable names
     :param title: Plot title
