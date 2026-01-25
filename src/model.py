@@ -1,4 +1,9 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Literal, Optional, Tuple
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
 
 class Model(ABC):
     """
@@ -26,11 +31,6 @@ class Model(ABC):
         """
         pass
 
-
-from dataclasses import dataclass
-from typing import Literal, Optional, Tuple
-import numpy as np
-import pandas as pd
 
 
 
@@ -416,8 +416,6 @@ class EM_PCA:
         print(f"CT pour r={self.kmax}: {CT[-1]:.6f}")
         # Return 0 if r=0 selected, otherwise return r
         
-
-        # DEBUG: PQ CA PREND TJRS LE MAX
         if self.verbose:
             print(f"\n{'='*70}")
             print(f"  BAI-NG IC{jj} DEBUG")
@@ -433,7 +431,6 @@ class EM_PCA:
         
                 if i < self.kmax:  # r = 1 to kmax
                     r_val = i + 1
-                    # Recalcule V pour affichage
                     Fhat_k = Fhat0[:, :r_val]
                     Lambda_k = Lambda0[:, :r_val]
                     chat_k = Fhat_k @ Lambda_k.T
@@ -449,8 +446,6 @@ class EM_PCA:
             print(f"{'-'*65}")
             print(f"Selected: r = {ic_optimal_idx + 1 if ic_optimal_idx < self.kmax else 0}")
             print(f"{'='*70}\n")
-
-        # FIN DU DEBUG
 
         if ic_optimal_idx == self.kmax:
             return 0
@@ -490,6 +485,108 @@ class EM_PCA:
         
         return r2
     
+
+@dataclass
+class RollingRegressionResult:
+    """Store rolling regression results"""
+    dates: pd.DatetimeIndex
+    alpha: pd.Series
+    betas: pd.DataFrame
+    fitted: pd.Series
+    r2: pd.Series
+
+
+class RollingRegression:
+    """
+    Implements rolling linear regression.
+    """
+    def __init__(self, y: pd.Series, X: pd.DataFrame, window: int) -> None:
+        """
+        Parameters:
+        -----------
+        y : pd.Series - Dependent variable
+        X : pd.DataFrame - Independent variables (factors)
+        window : int - Rolling window size
+        """
+        if not isinstance(y, pd.Series):
+            raise TypeError("y must be a pandas Series")
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("X must be a pandas DataFrame")
+        if len(y) != len(X):
+            raise ValueError(f"y and X must have same length: {len(y)} != {len(X)}")
+        if window >= len(y):
+            raise ValueError(f"window ({window}) must be < data length ({len(y)})")
+        
+        self.y = y
+        self.X = X
+        self.window = window
+        self.T = len(y)
+        self.result_ = None
+    
+    def fit(self) -> RollingRegressionResult:
+        """
+        Fit rolling OLS regression.
+        
+        Returns:
+        --------
+        RollingRegressionResult with dates, coefficients, predictions, R²
+        """
+        dates, alphas, betas, fitted, r2s = [], [], [], [], []
+        
+        for t in range(self.window, self.T):
+            # Training window
+            y_window = self.y.iloc[t - self.window : t]
+            X_window = self.X.iloc[t - self.window : t]
+
+            # Add constant and fit
+            X_window_c = sm.add_constant(X_window)
+            model = sm.OLS(y_window, X_window_c).fit()
+
+            # Predict at time t (OOS)
+            # CORRECTION: construire manuellement le vecteur avec constante
+            X_oos = self.X.iloc[t].values  # shape (K,)
+            X_oos_c = np.concatenate([[1.0], X_oos])  # shape (K+1,) avec constante
+            y_pred = np.dot(X_oos_c, model.params)
+
+            # Store results
+            dates.append(self.y.index[t])
+            alphas.append(model.params[0])
+            betas.append(model.params[1:].values)
+            fitted.append(y_pred)
+            r2s.append(model.rsquared)
+        
+        # Convert to pandas objects with proper index
+        dates_idx = pd.DatetimeIndex(dates)
+        
+        self.result_ = RollingRegressionResult(
+            dates=dates_idx,
+            alpha=pd.Series(alphas, index=dates_idx, name='alpha'),
+            betas=pd.DataFrame(betas, index=dates_idx, columns=self.X.columns),
+            fitted=pd.Series(fitted, index=dates_idx, name='indicator_raw'),
+            r2=pd.Series(r2s, index=dates_idx, name='r2_train')
+        )
+        
+        return self.result_
+    
+    def summary(self) -> None:
+        """Print summary statistics of rolling regression"""
+        if self.result_ is None:
+            raise ValueError("Must call fit() before summary()")
+        
+        print(f"\n{'='*60}")
+        print(f"ROLLING REGRESSION SUMMARY")
+        print(f"{'='*60}")
+        print(f"Window size      : {self.window}")
+        print(f"Total periods    : {self.T}")
+        print(f"OOS predictions  : {len(self.result_.dates)}")
+        print(f"Mean train R²    : {self.result_.r2.mean():.4f}")
+        print(f"Std train R²     : {self.result_.r2.std():.4f}")
+        print(f"\nLast window coefficients:")
+        print(f"  Alpha          : {self.result_.alpha.iloc[-1]:.4f}")
+        for col, val in zip(self.X.columns, self.result_.betas.iloc[-1]):
+            print(f"  {col:12s}   : {val:8.4f}")
+        print(f"{'='*60}\n")
+
     # Class for factor model
 
     # Class for ridge model
