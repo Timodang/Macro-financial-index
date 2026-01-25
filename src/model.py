@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+import matplotlib.pyplot as plt
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Lasso, Ridge, ElasticNet
 
 class Model(ABC):
     """
@@ -97,7 +103,10 @@ class EM_PCA:
         self.n_factors_ = None
         # Mapping criterion name to numeric code
         self._criterion_map = {'IC1': 1, 'IC2': 2, 'IC3': 3}
-        
+        self.loadings_ = None          
+        self.factor_names_ = None      
+        self.feature_names_ = None     
+
     def fit(self, X: pd.DataFrame) -> EM_PCAResult:
         """
         Fit EM-PCA on panel data with missing values
@@ -194,6 +203,17 @@ class EM_PCA:
         resid = x_transformed - chat0
         variance_explained = 1.0 - (np.mean(resid**2) / np.mean(x_transformed**2))
         
+        factors_df = pd.DataFrame(
+            fhat, index=X.index, columns=[f"F{i+1}" for i in range(self.n_factors_)]
+        )
+        loadings_df = pd.DataFrame(
+            lambdahat, index=X.columns, columns=[f"F{i+1}" for i in range(self.n_factors_)]
+        )
+
+        self.loadings_ = loadings_df.copy()
+        self.feature_names_ = list(X.columns)
+        self.factor_names_ = list(factors_df.columns)  
+
         # STEP 7: RETURN RESULTS
         return EM_PCAResult(
             factors=pd.DataFrame(
@@ -224,45 +244,153 @@ class EM_PCA:
             variance_explained=variance_explained
         )
     
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+    def transform(
+        self,
+        X: pd.DataFrame,
+        em: bool = False,
+        max_iter: int = 50,
+        tol: float = 1e-6,
+        return_imputed: bool = False,
+        return_fitted: bool = False
+    ):
         """
-        Project new data onto fitted factors (out-of-sample)
-        We keep loadings fixed for OOS analysis (to predict without look-ahead bias)
-        NEEDS TO BE IMPLEMENTED
-        
-        Parameters:
-        -----------
+        Project new data onto fitted factors (out-of-sample).
+
+        Parameters
+        ----------
         X : pd.DataFrame (T_new × N)
-            New data with same N variables but new observations
-            
-        Returns:
-        --------
-        F_new : pd.DataFrame (T_new × r)
-            Projected factors
+        em : bool, default False
+            If True, perform EM on X with FIXED loadings (no re-estimation).
+        max_iter : int
+            Max EM iterations (used only if em=True)
+        tol : float
+            EM convergence tolerance (used only if em=True)
+        return_imputed : bool
+            If True, return imputed X (original scale)
+        return_fitted : bool
+            If True, return fitted X = F Lambda' (original scale)
+
+        Returns
+        -------
+        F_new : pd.DataFrame
+        [X_imputed] : pd.DataFrame (optional)
+        [X_fitted]  : pd.DataFrame (optional)
         """
-        if self.n_factors_ is None:
+
+        # -------------------- Checks --------------------
+        if self.n_factors_ is None or self.loadings_ is None:
             raise ValueError("Model not fitted yet. Call fit() first.")
-        
-        # Impute missing with training means
-        X_array = X.values
-        x_missing = np.isnan(X_array)
-        X_imputed = X_array.copy()
-        
-        # Use training means for imputation
-        col_mean_train = self.mean_[0, :] 
-        X_imputed[x_missing] = np.take(col_mean_train, np.where(x_missing)[1])
-        
-        # Transform with training parameters
-        X_transformed = (X_imputed - self.mean_[0, :]) / self.std_[0, :]
-        
-        # Project onto loadings: F_new = X_new @ lambda / N
-        # (Need to recompute loadings from last fit - store in fit())
-        # For now, raise NotImplementedError
-        raise NotImplementedError(
-            "Out-of-sample projection requires storing loadings. "
-            "Use fit() result's loadings and compute F = X @ Λ / N manually."
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("X must be a pandas DataFrame")
+        if self.feature_names_ is None:
+            raise ValueError("feature_names_ missing. Re-fit the model.")
+
+        # -------------------- Align columns --------------------
+        missing_cols = set(self.feature_names_) - set(X.columns)
+        extra_cols = set(X.columns) - set(self.feature_names_)
+        if missing_cols:
+            raise ValueError(f"X missing columns seen in fit(): {sorted(missing_cols)[:10]}")
+        if extra_cols:
+            raise ValueError(f"X has extra columns not seen in fit(): {sorted(extra_cols)[:10]}")
+
+        X_aligned = X.loc[:, self.feature_names_]
+
+        # -------------------- Prepare arrays --------------------
+        X0 = X_aligned.values.astype(float, copy=True)
+        miss = np.isnan(X0)
+
+        mu = self.mean_[0, :]
+        sd = self.std_[0, :]
+        Lambda = self.loadings_.values      # (N × r)
+        N = Lambda.shape[0]
+
+        # Helpers: same transform as in fit
+        def _to_transformed(X_orig):
+            if self.demean == 0:
+                return X_orig
+            elif self.demean == 1:
+                return X_orig - mu
+            elif self.demean == 2:
+                return (X_orig - mu) / sd
+            else:
+                raise ValueError("demean must be 0, 1, or 2")
+
+        def _to_original(X_tr):
+            if self.demean == 0:
+                return X_tr
+            elif self.demean == 1:
+                return X_tr + mu
+            elif self.demean == 2:
+                return X_tr * sd + mu
+            else:
+                raise ValueError("demean must be 0, 1, or 2")
+
+        # -------------------- Initial imputation --------------------
+        X_imp = X0.copy()
+        if miss.any():
+            X_imp[miss] = np.take(mu, np.where(miss)[1])
+
+        # ==================== CASE 1: simple projection ====================
+        if not em:
+            X_tr = _to_transformed(X_imp)
+            F = (X_tr @ Lambda) / N
+            Xhat_tr = F @ Lambda.T
+            Xhat = _to_original(Xhat_tr)
+
+        # ==================== CASE 2: EM with fixed loadings ====================
+        else:
+            err = np.inf
+            it = 0
+
+            while it < max_iter and err > tol:
+                it += 1
+
+                # M-step: factor scores
+                X_tr = _to_transformed(X_imp)
+                F = (X_tr @ Lambda) / N
+                Xhat_tr = F @ Lambda.T
+
+                # E-step: update missing values only
+                X_tr_new = X_tr.copy()
+                if miss.any():
+                    X_tr_new[miss] = Xhat_tr[miss]
+
+                X_imp_new = _to_original(X_tr_new)
+
+                # convergence on missing entries
+                if miss.any():
+                    num = np.sum((X_imp_new[miss] - X_imp[miss]) ** 2)
+                    den = max(np.sum(X_imp[miss] ** 2), 1e-12)
+                    err = num / den
+                else:
+                    err = 0.0
+
+                X_imp = X_imp_new
+
+            # final reconstruction
+            X_tr = _to_transformed(X_imp)
+            F = (X_tr @ Lambda) / N
+            Xhat_tr = F @ Lambda.T
+            Xhat = _to_original(Xhat_tr)
+
+        # -------------------- Build outputs --------------------
+        factor_cols = (
+            self.factor_names_
+            if self.factor_names_ is not None
+            else [f"F{i+1}" for i in range(Lambda.shape[1])]
         )
-    
+
+        F_df = pd.DataFrame(F, index=X_aligned.index, columns=factor_cols)
+
+        outputs = [F_df]
+
+        if return_imputed:
+            outputs.append(pd.DataFrame(X_imp, index=X_aligned.index, columns=self.feature_names_))
+        if return_fitted:
+            outputs.append(pd.DataFrame(Xhat, index=X_aligned.index, columns=self.feature_names_))
+
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
     # ==================== PRIVATE METHODS ====================
     
     def _check_input_matrix(self, x: np.ndarray) -> None:
@@ -589,8 +717,1606 @@ class RollingRegression:
 
     # Class for factor model
 
-    # Class for ridge model
+    # Class for LASSO
 
-    # Class for group ridge model
 
-    # Class for random forest model
+@dataclass
+class RollingMLResult:
+    dates: pd.DatetimeIndex
+    y_true: pd.Series
+    y_pred: pd.Series
+    err: pd.Series
+    rmse_cum: pd.Series
+    rmse_roll: Optional[pd.Series] = None
+
+
+# ============================================================================
+# ROLLING LASSO WITH EM IMPUTATION
+# ============================================================================
+
+@dataclass
+class RollingLassoResult:
+    """
+    Save Lasso results
+    """
+    dates: pd.DatetimeIndex
+    y_true: pd.Series
+    y_pred: pd.Series
+    err: pd.Series
+    rmse_cum: pd.Series
+    rmse_roll: Optional[pd.Series] = None
+    coefficients: Optional[pd.DataFrame] = None
+    has_missing_by_window: pd.Series = None
+    n_nonzero_coefs: pd.Series = None
+
+
+class RollingLasso:
+    """
+    LASSO on a rolling window. 
+    Missing values are handled via EM algorithm considering only the window.
+    The code works in 3 steps:
+        - impute missing values in the window if needed using EM-PCA
+        - fit LASSO on imputed variables on the window to predict y_t
+        -
+    """
+    
+    def __init__(
+        self,
+        window: int = 36,
+        alpha: float = 0.01,
+        imputation_method: Literal['em', 'median', 'forward_fill', 'none'] = 'em',
+        n_factors_imputation: int = 10,
+        max_iter_lasso: int = 10000,
+        max_iter_em: int = 50,
+        rmse_window: Optional[int] = 12,
+        store_coefs: bool = False,
+        verbose: bool = True,
+    ) -> None:
+        """
+        Parameters:
+        -----------
+        - window       : int
+            Length of the rolling window in months
+        - alpha        : float
+            LASSO penalty (hyperparameter)
+        - imputation_method : str
+            Method to use to replace missing value (should be em)
+        - n_factors_imputation : int
+            Number of factors to use for EM replacement
+        - max_iter_lasso : int
+            Maximum number of iterations for the LASSO
+        - max_iter_em : int
+            Maximum number of iterations for the EM algorithm
+        - rmse_window : int 
+            Window to use for the computation of the rolling RMSE
+        - store_coefs : bool
+            True if rolling coefficients have to be stored
+        - verbose : bool
+            True if extensive user log should be printed  
+        """
+        self.window = window
+        self.alpha = alpha
+        self.imputation_method = imputation_method
+        self.n_factors_imputation = n_factors_imputation
+        self.max_iter_lasso = max_iter_lasso
+        self.max_iter_em = max_iter_em
+        self.rmse_window = rmse_window
+        self.store_coefs = store_coefs
+        self.verbose = verbose
+        self.result_: Optional[RollingLassoResult] = None
+        
+    def _has_missing(self, X: pd.DataFrame) -> bool:
+        """
+        Check if a given dataframe contains any missing value
+        """
+        return X.isna().any().any()
+    
+    def _impute_median(self, X: pd.DataFrame) -> pd.DataFrame:
+        return X.fillna(X.median())
+    
+    def _impute_forward_fill(self, X: pd.DataFrame) -> pd.DataFrame:
+        X_filled = X.ffill()
+        return X_filled.fillna(X_filled.median())
+    
+    def _impute_em(self, X: pd.DataFrame) -> Tuple[pd.DataFrame, object]:
+        """
+        Replace missing values of X by lambda'*F using EM algorithm
+        """
+
+        empca = EM_PCA(
+            kmax=self.n_factors_imputation,
+            criterion='IC2',
+            demean=2,
+            max_iter=self.max_iter_em,
+            verbose=False,
+            fallback_n_factors=min(3, self.n_factors_imputation)
+        )
+        result = empca.fit(X)
+        return result.imputed_data, empca
+    
+    def _impute_data(
+        self, 
+        X_train: pd.DataFrame, 
+        X_test: Optional[pd.DataFrame] = None
+        ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+
+        """
+        Verify if the dataframe contains missing values. If it
+        does, replace those missing values following the given procedure.
+        """
+
+        has_missing_train = self._has_missing(X_train)
+        has_missing_test = X_test is not None and self._has_missing(X_test)
+        
+        if self.imputation_method == 'none':
+            if has_missing_train or has_missing_test:
+                raise ValueError("Missing values detected but imputation_method='none'")
+            return X_train, X_test
+        
+        if self.imputation_method == "em":
+            X_train_imputed, empca_model = self._impute_em(X_train)
+        elif self.imputation_method == "median":
+            X_train_imputed = self._impute_median(X_train); empca_model=None
+        elif self.imputation_method == "forward_fill":
+            X_train_imputed = self._impute_forward_fill(X_train); empca_model=None
+        else:
+            raise ValueError("Imputation method should be ideally EM")
+
+        
+        if X_test is None or not has_missing_test:
+            X_test_imputed = X_test
+        else:
+            if self.imputation_method == 'em' and empca_model is not None:
+                F_oos, X_test_imp = empca_model.transform(X_test, em=True, return_imputed=True)
+                X_test_imputed = X_test_imp
+            elif self.imputation_method == 'median':
+                X_test_imputed = X_test.fillna(X_train.median())
+            elif self.imputation_method == 'forward_fill':
+                X_test_imputed = X_test.ffill()
+                X_test_imputed = X_test_imputed.fillna(X_train.median())
+        
+        return X_train_imputed, X_test_imputed
+    
+    def fit(self, y: pd.Series, X: pd.DataFrame) -> RollingLassoResult:
+        """
+        Run the LASSO regression on a rolling window basis.
+        """
+        if len(y) != len(X):
+            raise ValueError(f"y and X must have same length: {len(y)} != {len(X)}")
+        if self.window >= len(y):
+            raise ValueError(f"window ({self.window}) must be < data length ({len(y)})")
+        
+        df = pd.concat([y.rename("y"), X], axis=1)
+        y_al = df["y"]
+        X_al = df.drop(columns=["y"])
+        T = len(df)
+        
+        # Storage
+        y_pred_list = []
+        y_true_list = []
+        dates_list = []
+        has_missing_list = []
+        n_nonzero_list = []
+        coefs_list = [] if self.store_coefs else None
+        
+        for t in range(self.window, T):
+            if self.verbose and t % 12 == 0:
+                print(f"Processing t={t}/{T} ({y_al.index[t].strftime('%Y-%m')})")
+            
+            # The window = train ; after it = test
+            X_train = X_al.iloc[t - self.window : t]
+            y_train = y_al.iloc[t - self.window : t]
+            X_test = X_al.iloc[[t]]
+            y_test = y_al.iloc[t]
+            
+            has_missing = self._has_missing(X_train) or self._has_missing(X_test)
+            has_missing_list.append(has_missing)
+            
+            try:
+                X_train_imputed, X_test_imputed = self._impute_data(X_train, X_test)
+            except Exception as e:
+                if self.verbose:
+                    print(f"  WARNING: Imputation failed at t={t}: {e}")
+                continue
+            
+            # Align on window
+            common_idx = y_train.index.intersection(X_train_imputed.index)
+            y_train_al = y_train.loc[common_idx]
+            X_train_al = X_train_imputed.loc[common_idx]
+            
+            if len(y_train_al) < 10:
+                if self.verbose:
+                    print(f"  WARNING: Only {len(y_train_al)} observations at t={t}, skipping")
+                continue
+            # Scale using training set
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train_al.values)
+            
+            lasso = Lasso(
+                alpha=self.alpha,
+                fit_intercept=True,
+                max_iter=self.max_iter_lasso,
+                random_state=42
+            )
+            lasso.fit(X_train_scaled, y_train_al.values)
+            
+            # Scale test set using train stats 
+            X_test_scaled = scaler.transform(X_test_imputed.values)
+
+            # Predict using the model
+            y_pred = lasso.predict(X_test_scaled)[0]
+            
+            dates_list.append(y_al.index[t])
+            y_true_list.append(y_test)
+            y_pred_list.append(y_pred)
+            
+            n_nonzero = np.sum(lasso.coef_ != 0)
+            n_nonzero_list.append(n_nonzero)
+            
+            if self.store_coefs:
+                coef_dict = {'intercept': lasso.intercept_}
+                coef_dict.update({col: coef for col, coef in zip(X_al.columns, lasso.coef_)})
+                coefs_list.append(coef_dict)
+        
+        dates_idx = pd.DatetimeIndex(dates_list)
+        y_true = pd.Series(y_true_list, index=dates_idx, name="y_true")
+        y_pred = pd.Series(y_pred_list, index=dates_idx, name="y_pred")
+
+        # Compute OOS error and RMSE
+        err = y_true - y_pred
+        err.name = "error"
+        
+        # Cumulative RMSE, i.e. the final one = RMSE on ALL the OOS predictions. 
+        rmse_cum = np.sqrt((err ** 2).expanding().mean())
+        rmse_cum.name = "rmse_cum"
+        
+        rmse_roll = None
+        if self.rmse_window is not None and self.rmse_window >= 2:
+            rmse_roll = np.sqrt((err ** 2).rolling(self.rmse_window).mean())
+            rmse_roll.name = f"rmse_roll_{self.rmse_window}"
+        
+        has_missing_series = pd.Series(has_missing_list, index=dates_idx, name="has_missing")
+        n_nonzero_series = pd.Series(n_nonzero_list, index=dates_idx, name="n_nonzero_coefs")
+        
+        coefs_df = None
+        if self.store_coefs:
+            coefs_df = pd.DataFrame(coefs_list, index=dates_idx)
+        
+        # Results
+        self.result_ = RollingLassoResult(
+            dates=dates_idx,
+            y_true=y_true,
+            y_pred=y_pred,
+            err=err,
+            rmse_cum=rmse_cum,
+            rmse_roll=rmse_roll,
+            coefficients=coefs_df,
+            has_missing_by_window=has_missing_series,
+            n_nonzero_coefs=n_nonzero_series
+        )
+        
+        if self.verbose:
+            self._print_summary()
+        
+        return self.result_
+    
+    def _print_summary(self):
+        res = self.result_
+        print(f"\n{'='*70}")
+        print(f"ROLLING LASSO WITH EM IMPUTATION - SUMMARY")
+        print(f"{'='*70}")
+        print(f"Window size          : {self.window}")
+        print(f"Alpha (Lasso)        : {self.alpha}")
+        print(f"Imputation method    : {self.imputation_method}")
+        print(f"N° of predictions    : {len(res.dates)}")
+        print(f"\nVariable selection:")
+        print(f"  Mean n° non-zero   : {res.n_nonzero_coefs.mean():.1f}")
+        print(f"  Std n° non-zero    : {res.n_nonzero_coefs.std():.1f}")
+        print(f"  Min - Max          : {res.n_nonzero_coefs.min()} - {res.n_nonzero_coefs.max()}")
+        print(f"\nMissing data:")
+        pct_missing = 100 * res.has_missing_by_window.sum() / len(res.has_missing_by_window)
+        print(f"  Windows with missing: {pct_missing:.1f}% ({res.has_missing_by_window.sum()} / {len(res.dates)})")
+        print(f"\nPerformance (out-of-sample):")
+        print(f"  Final RMSE (cum)   : {res.rmse_cum.iloc[-1]:.4f}")
+        print(f"  Mean absolute error: {res.err.abs().mean():.4f}")
+        print(f"  Std of errors      : {res.err.std():.4f}")
+        print(f"{'='*70}\n")
+    
+    def predict(self) -> pd.Series:
+        if self.result_ is None:
+            raise ValueError("Must call fit() before predict()")
+        return self.result_.y_pred
+    
+
+
+
+
+
+# ============================================================================
+# ROLLING RIDGE WITH EM IMPUTATION
+# ============================================================================
+
+class RollingRidge:
+    """
+    RIDGE on a rolling window with EM imputation
+    Identical to RollingLasso but uses Ridge regression (L2 penalty)
+    """
+    
+    def __init__(
+        self,
+        window: int = 36,
+        alpha: float = 1.0,  # Ridge typically uses larger alpha than Lasso
+        imputation_method: Literal['em', 'median', 'forward_fill', 'none'] = 'em',
+        n_factors_imputation: int = 10,
+        max_iter_ridge: int = 10000,
+        max_iter_em: int = 50,
+        rmse_window: Optional[int] = 12,
+        store_coefs: bool = False,
+        verbose: bool = True,
+    ) -> None:
+        """
+        Parameters:
+        -----------
+        - window       : int
+            Length of the rolling window in months
+        - alpha        : float
+            Ridge penalty (L2 regularization strength)
+            Note: Ridge typically uses larger alpha than Lasso (e.g. 1.0 instead of 0.01)
+        - imputation_method : str
+            Method to use to replace missing value (should be em)
+        - n_factors_imputation : int
+            Number of factors to use for EM replacement
+        - max_iter_ridge : int
+            Maximum number of iterations for Ridge
+        - max_iter_em : int
+            Maximum number of iterations for the EM algorithm
+        - rmse_window : int 
+            Window to use for the computation of the rolling RMSE
+        - store_coefs : bool
+            True if rolling coefficients have to be stored
+        - verbose : bool
+            True if extensive user log should be printed  
+        """
+        self.window = window
+        self.alpha = alpha
+        self.imputation_method = imputation_method
+        self.n_factors_imputation = n_factors_imputation
+        self.max_iter_ridge = max_iter_ridge
+        self.max_iter_em = max_iter_em
+        self.rmse_window = rmse_window
+        self.store_coefs = store_coefs
+        self.verbose = verbose
+        self.result_: Optional[RollingLassoResult] = None
+        
+    def _has_missing(self, X: pd.DataFrame) -> bool:
+        return X.isna().any().any()
+    
+    def _impute_median(self, X: pd.DataFrame) -> pd.DataFrame:
+        return X.fillna(X.median())
+    
+    def _impute_forward_fill(self, X: pd.DataFrame) -> pd.DataFrame:
+        X_filled = X.ffill()
+        return X_filled.fillna(X_filled.median())
+    
+    def _impute_em(self, X: pd.DataFrame) -> Tuple[pd.DataFrame, object]:
+        empca = EM_PCA(
+            kmax=self.n_factors_imputation,
+            criterion='IC2',
+            demean=2,
+            max_iter=self.max_iter_em,
+            verbose=False,
+            fallback_n_factors=min(3, self.n_factors_imputation)
+        )
+        result = empca.fit(X)
+        return result.imputed_data, empca
+    
+    def _impute_data(
+        self, 
+        X_train: pd.DataFrame, 
+        X_test: Optional[pd.DataFrame] = None
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        has_missing_train = self._has_missing(X_train)
+        has_missing_test = X_test is not None and self._has_missing(X_test)
+        
+        if self.imputation_method == 'none':
+            if has_missing_train or has_missing_test:
+                raise ValueError("Missing values detected but imputation_method='none'")
+            return X_train, X_test
+        
+        if not has_missing_train:
+            X_train_imputed = X_train.copy()
+            empca_model = None
+        else:
+            if self.imputation_method == 'em':
+                X_train_imputed, empca_model = self._impute_em(X_train)
+            elif self.imputation_method == 'median':
+                X_train_imputed = self._impute_median(X_train)
+                empca_model = None
+            elif self.imputation_method == 'forward_fill':
+                X_train_imputed = self._impute_forward_fill(X_train)
+                empca_model = None
+        
+        if X_test is None or not has_missing_test:
+            X_test_imputed = X_test
+        else:
+            if self.imputation_method == 'em' and empca_model is not None:
+                F_oos, X_test_imp = empca_model.transform(X_test, em=True, return_imputed=True)
+                X_test_imputed = X_test_imp
+            elif self.imputation_method == 'median':
+                X_test_imputed = X_test.fillna(X_train.median())
+            elif self.imputation_method == 'forward_fill':
+                X_test_imputed = X_test.ffill()
+                X_test_imputed = X_test_imputed.fillna(X_train.median())
+        
+        return X_train_imputed, X_test_imputed
+    
+    def fit(self, y: pd.Series, X: pd.DataFrame) -> RollingLassoResult:
+        """
+        Run Ridge regression on a rolling window basis.
+        """
+        if len(y) != len(X):
+            raise ValueError(f"y and X must have same length: {len(y)} != {len(X)}")
+        if self.window >= len(y):
+            raise ValueError(f"window ({self.window}) must be < data length ({len(y)})")
+        
+        df = pd.concat([y.rename("y"), X], axis=1)
+        y_al = df["y"]
+        X_al = df.drop(columns=["y"])
+        T = len(df)
+        
+        y_pred_list = []
+        y_true_list = []
+        dates_list = []
+        has_missing_list = []
+        n_nonzero_list = []
+        coefs_list = [] if self.store_coefs else None
+        
+        for t in range(self.window, T):
+            if self.verbose and t % 12 == 0:
+                print(f"Processing t={t}/{T} ({y_al.index[t].strftime('%Y-%m')})")
+            
+            X_train = X_al.iloc[t - self.window : t]
+            y_train = y_al.iloc[t - self.window : t]
+            X_test = X_al.iloc[[t]]
+            y_test = y_al.iloc[t]
+            
+            has_missing = self._has_missing(X_train) or self._has_missing(X_test)
+            has_missing_list.append(has_missing)
+            
+            try:
+                X_train_imputed, X_test_imputed = self._impute_data(X_train, X_test)
+            except Exception as e:
+                if self.verbose:
+                    print(f"  WARNING: Imputation failed at t={t}: {e}")
+                continue
+            
+            common_idx = y_train.index.intersection(X_train_imputed.index)
+            y_train_al = y_train.loc[common_idx]
+            X_train_al = X_train_imputed.loc[common_idx]
+            
+            if len(y_train_al) < 10:
+                if self.verbose:
+                    print(f"  WARNING: Only {len(y_train_al)} observations at t={t}, skipping")
+                continue
+            
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train_al.values)
+            
+            # ============ DIFFÉRENCE : Ridge au lieu de Lasso ============
+            ridge = Ridge(
+                alpha=self.alpha,
+                fit_intercept=True,
+                max_iter=self.max_iter_ridge,
+                random_state=42
+            )
+            ridge.fit(X_train_scaled, y_train_al.values)
+            # =============================================================
+            
+            X_test_scaled = scaler.transform(X_test_imputed.values)
+            y_pred = ridge.predict(X_test_scaled)[0]
+            
+            dates_list.append(y_al.index[t])
+            y_true_list.append(y_test)
+            y_pred_list.append(y_pred)
+            
+            # Ridge ne fait PAS de sélection de variables (tous les coefs ≠ 0)
+            n_nonzero = np.sum(ridge.coef_ != 0)
+            n_nonzero_list.append(n_nonzero)
+            
+            if self.store_coefs:
+                coef_dict = {'intercept': ridge.intercept_}
+                coef_dict.update({col: coef for col, coef in zip(X_al.columns, ridge.coef_)})
+                coefs_list.append(coef_dict)
+        
+        dates_idx = pd.DatetimeIndex(dates_list)
+        y_true = pd.Series(y_true_list, index=dates_idx, name="y_true")
+        y_pred = pd.Series(y_pred_list, index=dates_idx, name="y_pred")
+        err = y_true - y_pred
+        err.name = "error"
+        
+        rmse_cum = np.sqrt((err ** 2).expanding().mean())
+        rmse_cum.name = "rmse_cum"
+        
+        rmse_roll = None
+        if self.rmse_window is not None and self.rmse_window >= 2:
+            rmse_roll = np.sqrt((err ** 2).rolling(self.rmse_window).mean())
+            rmse_roll.name = f"rmse_roll_{self.rmse_window}"
+        
+        has_missing_series = pd.Series(has_missing_list, index=dates_idx, name="has_missing")
+        n_nonzero_series = pd.Series(n_nonzero_list, index=dates_idx, name="n_nonzero_coefs")
+        
+        coefs_df = None
+        if self.store_coefs:
+            coefs_df = pd.DataFrame(coefs_list, index=dates_idx)
+        
+        self.result_ = RollingLassoResult(
+            dates=dates_idx,
+            y_true=y_true,
+            y_pred=y_pred,
+            err=err,
+            rmse_cum=rmse_cum,
+            rmse_roll=rmse_roll,
+            coefficients=coefs_df,
+            has_missing_by_window=has_missing_series,
+            n_nonzero_coefs=n_nonzero_series
+        )
+        
+        if self.verbose:
+            self._print_summary()
+        
+        return self.result_
+    
+    def _print_summary(self):
+        res = self.result_
+        print(f"\n{'='*70}")
+        print(f"ROLLING RIDGE WITH EM IMPUTATION - SUMMARY")
+        print(f"{'='*70}")
+        print(f"Window size          : {self.window}")
+        print(f"Alpha (Ridge)        : {self.alpha}")
+        print(f"Imputation method    : {self.imputation_method}")
+        print(f"N° of predictions    : {len(res.dates)}")
+        print(f"\nCoefficient statistics:")
+        print(f"  Mean n° non-zero   : {res.n_nonzero_coefs.mean():.1f}")
+        print(f"  (Ridge keeps all variables, but shrinks coefficients)")
+        print(f"\nMissing data:")
+        pct_missing = 100 * res.has_missing_by_window.sum() / len(res.has_missing_by_window)
+        print(f"  Windows with missing: {pct_missing:.1f}% ({res.has_missing_by_window.sum()} / {len(res.dates)})")
+        print(f"\nPerformance (out-of-sample):")
+        print(f"  Final RMSE (cum)   : {res.rmse_cum.iloc[-1]:.4f}")
+        print(f"  Mean absolute error: {res.err.abs().mean():.4f}")
+        print(f"  Std of errors      : {res.err.std():.4f}")
+        print(f"{'='*70}\n")
+    
+    def predict(self) -> pd.Series:
+        if self.result_ is None:
+            raise ValueError("Must call fit() before predict()")
+        return self.result_.y_pred
+
+
+# ============================================================================
+# ROLLING ELASTIC NET WITH EM IMPUTATION
+# ============================================================================
+
+class RollingElasticNet:
+    """
+    ELASTIC NET on a rolling window with EM imputation
+    Combines L1 (Lasso) and L2 (Ridge) penalties
+    """
+    
+    def __init__(
+        self,
+        window: int = 36,
+        alpha: float = 0.01,
+        l1_ratio: float = 0.5,  # 0 = Ridge, 1 = Lasso, 0.5 = 50/50 mix
+        imputation_method: Literal['em', 'median', 'forward_fill', 'none'] = 'em',
+        n_factors_imputation: int = 10,
+        max_iter_en: int = 10000,
+        max_iter_em: int = 50,
+        rmse_window: Optional[int] = 12,
+        store_coefs: bool = False,
+        verbose: bool = True,
+    ) -> None:
+        """
+        Parameters:
+        -----------
+        - window       : int
+            Length of the rolling window in months
+        - alpha        : float
+            Overall regularization strength
+        - l1_ratio     : float in [0, 1]
+            Mix between L1 and L2 penalty:
+            - l1_ratio = 0  → Pure Ridge (L2)
+            - l1_ratio = 1  → Pure Lasso (L1)
+            - l1_ratio = 0.5 → 50% Lasso + 50% Ridge (RECOMMENDED)
+        - imputation_method : str
+            Method to use to replace missing value (should be em)
+        - n_factors_imputation : int
+            Number of factors to use for EM replacement
+        - max_iter_en : int
+            Maximum number of iterations for Elastic Net
+        - max_iter_em : int
+            Maximum number of iterations for the EM algorithm
+        - rmse_window : int 
+            Window to use for the computation of the rolling RMSE
+        - store_coefs : bool
+            True if rolling coefficients have to be stored
+        - verbose : bool
+            True if extensive user log should be printed  
+        """
+        self.window = window
+        self.alpha = alpha
+        self.l1_ratio = l1_ratio
+        self.imputation_method = imputation_method
+        self.n_factors_imputation = n_factors_imputation
+        self.max_iter_en = max_iter_en
+        self.max_iter_em = max_iter_em
+        self.rmse_window = rmse_window
+        self.store_coefs = store_coefs
+        self.verbose = verbose
+        self.result_: Optional[RollingLassoResult] = None
+        
+    def _has_missing(self, X: pd.DataFrame) -> bool:
+        return X.isna().any().any()
+    
+    def _impute_median(self, X: pd.DataFrame) -> pd.DataFrame:
+        return X.fillna(X.median())
+    
+    def _impute_forward_fill(self, X: pd.DataFrame) -> pd.DataFrame:
+        X_filled = X.ffill()
+        return X_filled.fillna(X_filled.median())
+    
+    def _impute_em(self, X: pd.DataFrame) -> Tuple[pd.DataFrame, object]:
+        empca = EM_PCA(
+            kmax=self.n_factors_imputation,
+            criterion='IC2',
+            demean=2,
+            max_iter=self.max_iter_em,
+            verbose=False,
+            fallback_n_factors=min(3, self.n_factors_imputation)
+        )
+        result = empca.fit(X)
+        return result.imputed_data, empca
+    
+    def _impute_data(
+        self, 
+        X_train: pd.DataFrame, 
+        X_test: Optional[pd.DataFrame] = None
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        has_missing_train = self._has_missing(X_train)
+        has_missing_test = X_test is not None and self._has_missing(X_test)
+        
+        if self.imputation_method == 'none':
+            if has_missing_train or has_missing_test:
+                raise ValueError("Missing values detected but imputation_method='none'")
+            return X_train, X_test
+        
+        if not has_missing_train:
+            X_train_imputed = X_train.copy()
+            empca_model = None
+        else:
+            if self.imputation_method == 'em':
+                X_train_imputed, empca_model = self._impute_em(X_train)
+            elif self.imputation_method == 'median':
+                X_train_imputed = self._impute_median(X_train)
+                empca_model = None
+            elif self.imputation_method == 'forward_fill':
+                X_train_imputed = self._impute_forward_fill(X_train)
+                empca_model = None
+        
+        if X_test is None or not has_missing_test:
+            X_test_imputed = X_test
+        else:
+            if self.imputation_method == 'em' and empca_model is not None:
+                F_oos, X_test_imp = empca_model.transform(X_test, em=True, return_imputed=True)
+                X_test_imputed = X_test_imp
+            elif self.imputation_method == 'median':
+                X_test_imputed = X_test.fillna(X_train.median())
+            elif self.imputation_method == 'forward_fill':
+                X_test_imputed = X_test.ffill()
+                X_test_imputed = X_test_imputed.fillna(X_train.median())
+        
+        return X_train_imputed, X_test_imputed
+    
+    def fit(self, y: pd.Series, X: pd.DataFrame) -> RollingLassoResult:
+        """
+        Run Elastic Net regression on a rolling window basis.
+        """
+        if len(y) != len(X):
+            raise ValueError(f"y and X must have same length: {len(y)} != {len(X)}")
+        if self.window >= len(y):
+            raise ValueError(f"window ({self.window}) must be < data length ({len(y)})")
+        
+        df = pd.concat([y.rename("y"), X], axis=1)
+        y_al = df["y"]
+        X_al = df.drop(columns=["y"])
+        T = len(df)
+        
+        y_pred_list = []
+        y_true_list = []
+        dates_list = []
+        has_missing_list = []
+        n_nonzero_list = []
+        coefs_list = [] if self.store_coefs else None
+        
+        for t in range(self.window, T):
+            if self.verbose and t % 12 == 0:
+                print(f"Processing t={t}/{T} ({y_al.index[t].strftime('%Y-%m')})")
+            
+            X_train = X_al.iloc[t - self.window : t]
+            y_train = y_al.iloc[t - self.window : t]
+            X_test = X_al.iloc[[t]]
+            y_test = y_al.iloc[t]
+            
+            has_missing = self._has_missing(X_train) or self._has_missing(X_test)
+            has_missing_list.append(has_missing)
+            
+            try:
+                X_train_imputed, X_test_imputed = self._impute_data(X_train, X_test)
+            except Exception as e:
+                if self.verbose:
+                    print(f"  WARNING: Imputation failed at t={t}: {e}")
+                continue
+            
+            common_idx = y_train.index.intersection(X_train_imputed.index)
+            y_train_al = y_train.loc[common_idx]
+            X_train_al = X_train_imputed.loc[common_idx]
+            
+            if len(y_train_al) < 10:
+                if self.verbose:
+                    print(f"  WARNING: Only {len(y_train_al)} observations at t={t}, skipping")
+                continue
+            
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train_al.values)
+            
+            # ============ DIFFÉRENCE : Elastic Net ============
+            elasticnet = ElasticNet(
+                alpha=self.alpha,
+                l1_ratio=self.l1_ratio,
+                fit_intercept=True,
+                max_iter=self.max_iter_en,
+                random_state=42
+            )
+            elasticnet.fit(X_train_scaled, y_train_al.values)
+            # ==================================================
+            
+            X_test_scaled = scaler.transform(X_test_imputed.values)
+            y_pred = elasticnet.predict(X_test_scaled)[0]
+            
+            dates_list.append(y_al.index[t])
+            y_true_list.append(y_test)
+            y_pred_list.append(y_pred)
+            
+            n_nonzero = np.sum(elasticnet.coef_ != 0)
+            n_nonzero_list.append(n_nonzero)
+            
+            if self.store_coefs:
+                coef_dict = {'intercept': elasticnet.intercept_}
+                coef_dict.update({col: coef for col, coef in zip(X_al.columns, elasticnet.coef_)})
+                coefs_list.append(coef_dict)
+        
+        dates_idx = pd.DatetimeIndex(dates_list)
+        y_true = pd.Series(y_true_list, index=dates_idx, name="y_true")
+        y_pred = pd.Series(y_pred_list, index=dates_idx, name="y_pred")
+        err = y_true - y_pred
+        err.name = "error"
+        
+        rmse_cum = np.sqrt((err ** 2).expanding().mean())
+        rmse_cum.name = "rmse_cum"
+        
+        rmse_roll = None
+        if self.rmse_window is not None and self.rmse_window >= 2:
+            rmse_roll = np.sqrt((err ** 2).rolling(self.rmse_window).mean())
+            rmse_roll.name = f"rmse_roll_{self.rmse_window}"
+        
+        has_missing_series = pd.Series(has_missing_list, index=dates_idx, name="has_missing")
+        n_nonzero_series = pd.Series(n_nonzero_list, index=dates_idx, name="n_nonzero_coefs")
+        
+        coefs_df = None
+        if self.store_coefs:
+            coefs_df = pd.DataFrame(coefs_list, index=dates_idx)
+        
+        self.result_ = RollingLassoResult(
+            dates=dates_idx,
+            y_true=y_true,
+            y_pred=y_pred,
+            err=err,
+            rmse_cum=rmse_cum,
+            rmse_roll=rmse_roll,
+            coefficients=coefs_df,
+            has_missing_by_window=has_missing_series,
+            n_nonzero_coefs=n_nonzero_series
+        )
+        
+        if self.verbose:
+            self._print_summary()
+        
+        return self.result_
+    
+    def _print_summary(self):
+        res = self.result_
+        print(f"\n{'='*70}")
+        print(f"ROLLING ELASTIC NET WITH EM IMPUTATION - SUMMARY")
+        print(f"{'='*70}")
+        print(f"Window size          : {self.window}")
+        print(f"Alpha (overall)      : {self.alpha}")
+        print(f"L1 ratio             : {self.l1_ratio} ({self.l1_ratio*100:.0f}% Lasso, {(1-self.l1_ratio)*100:.0f}% Ridge)")
+        print(f"Imputation method    : {self.imputation_method}")
+        print(f"N° of predictions    : {len(res.dates)}")
+        print(f"\nVariable selection:")
+        print(f"  Mean n° non-zero   : {res.n_nonzero_coefs.mean():.1f}")
+        print(f"  Std n° non-zero    : {res.n_nonzero_coefs.std():.1f}")
+        print(f"  Min - Max          : {res.n_nonzero_coefs.min()} - {res.n_nonzero_coefs.max()}")
+        print(f"\nMissing data:")
+        pct_missing = 100 * res.has_missing_by_window.sum() / len(res.has_missing_by_window)
+        print(f"  Windows with missing: {pct_missing:.1f}% ({res.has_missing_by_window.sum()} / {len(res.dates)})")
+        print(f"\nPerformance (out-of-sample):")
+        print(f"  Final RMSE (cum)   : {res.rmse_cum.iloc[-1]:.4f}")
+        print(f"  Mean absolute error: {res.err.abs().mean():.4f}")
+        print(f"  Std of errors      : {res.err.std():.4f}")
+        print(f"{'='*70}\n")
+    
+    def predict(self) -> pd.Series:
+        if self.result_ is None:
+            raise ValueError("Must call fit() before predict()")
+        return self.result_.y_pred
+
+
+class RollingAdaptiveLasso:
+    """
+    Adaptive Lasso on rolling window with EM imputation
+    
+    Two-step procedure:
+    1. Initial estimation (Ridge or Lasso) to get β̂_initial
+    2. Adaptive Lasso with weights wⱼ = 1/|β̂ⱼ|^γ
+    
+    This gives better variable selection and less bias than standard Lasso.
+    """
+    
+    def __init__(
+        self,
+        window: int = 36,
+        alpha: float = 0.01,
+        gamma: float = 1.0,  # Adaptive weight power (typically 0.5, 1, or 2)
+        initial_estimator: Literal['ridge', 'lasso', 'ols'] = 'ridge',
+        alpha_initial: float = 1.0,  # Alpha for initial Ridge/Lasso
+        imputation_method: Literal['em', 'median', 'forward_fill', 'none'] = 'em',
+        n_factors_imputation: int = 10,
+        max_iter_lasso: int = 10000,
+        max_iter_em: int = 50,
+        rmse_window: Optional[int] = 12,
+        store_coefs: bool = False,
+        verbose: bool = True,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        gamma : float
+            Power for adaptive weights. Common values:
+            - γ=0.5 : Less aggressive weighting
+            - γ=1.0 : Standard (RECOMMENDED)
+            - γ=2.0 : More aggressive weighting
+        initial_estimator : str
+            Method for initial coefficient estimation:
+            - 'ridge' : Ridge regression (RECOMMENDED for p > n)
+            - 'lasso' : Standard Lasso
+            - 'ols'   : OLS (only if n >> p)
+        alpha_initial : float
+            Regularization for initial estimator (if ridge/lasso)
+        """
+        self.window = window
+        self.alpha = alpha
+        self.gamma = gamma
+        self.initial_estimator = initial_estimator
+        self.alpha_initial = alpha_initial
+        self.imputation_method = imputation_method
+        self.n_factors_imputation = n_factors_imputation
+        self.max_iter_lasso = max_iter_lasso
+        self.max_iter_em = max_iter_em
+        self.rmse_window = rmse_window
+        self.store_coefs = store_coefs
+        self.verbose = verbose
+        self.result_ = None
+        
+    def _has_missing(self, X: pd.DataFrame) -> bool:
+        return X.isna().any().any()
+    
+    def _impute_em(self, X: pd.DataFrame) -> Tuple[pd.DataFrame, object]:
+        empca = EM_PCA(
+            kmax=self.n_factors_imputation,
+            criterion='IC2',
+            demean=2,
+            max_iter=self.max_iter_em,
+            verbose=False,
+            fallback_n_factors=min(3, self.n_factors_imputation)
+        )
+        result = empca.fit(X)
+        return result.imputed_data, empca
+    
+    def _impute_data(
+        self, 
+        X_train: pd.DataFrame, 
+        X_test: Optional[pd.DataFrame] = None
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        has_missing_train = self._has_missing(X_train)
+        has_missing_test = X_test is not None and self._has_missing(X_test)
+        
+        if self.imputation_method == 'none':
+            if has_missing_train or has_missing_test:
+                raise ValueError("Missing values detected but imputation_method='none'")
+            return X_train, X_test
+        
+        if not has_missing_train:
+            X_train_imputed = X_train.copy()
+            empca_model = None
+        else:
+            if self.imputation_method == 'em':
+                X_train_imputed, empca_model = self._impute_em(X_train)
+            elif self.imputation_method == 'median':
+                X_train_imputed = X_train.fillna(X_train.median())
+                empca_model = None
+            elif self.imputation_method == 'forward_fill':
+                X_train_imputed = X_train.ffill().fillna(X_train.median())
+                empca_model = None
+        
+        if X_test is None or not has_missing_test:
+            X_test_imputed = X_test
+        else:
+            if self.imputation_method == 'em' and empca_model is not None:
+                F_oos, X_test_imp = empca_model.transform(X_test, em=True, return_imputed=True)
+                X_test_imputed = X_test_imp
+            elif self.imputation_method == 'median':
+                X_test_imputed = X_test.fillna(X_train.median())
+            elif self.imputation_method == 'forward_fill':
+                X_test_imputed = X_test.ffill().fillna(X_train.median())
+        
+        return X_train_imputed, X_test_imputed
+    
+    def _get_initial_weights(self, X_scaled: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """
+        Compute adaptive weights from initial estimation
+        
+        Returns
+        -------
+        weights : np.ndarray (p,)
+            Adaptive penalty weights wⱼ = 1/|β̂ⱼ|^γ
+        """
+        if self.initial_estimator == 'ridge':
+            model = Ridge(alpha=self.alpha_initial, fit_intercept=False)
+            model.fit(X_scaled, y)
+            beta_init = model.coef_
+            
+        elif self.initial_estimator == 'lasso':
+            model = Lasso(alpha=self.alpha_initial, fit_intercept=False, max_iter=self.max_iter_lasso)
+            model.fit(X_scaled, y)
+            beta_init = model.coef_
+            
+        elif self.initial_estimator == 'ols':
+            # OLS via normal equations (may be unstable if p > n)
+            try:
+                beta_init = np.linalg.lstsq(X_scaled, y, rcond=None)[0]
+            except np.linalg.LinAlgError:
+                # Fallback to Ridge if OLS fails
+                if self.verbose:
+                    print("  OLS failed, using Ridge instead")
+                model = Ridge(alpha=0.1, fit_intercept=False)
+                model.fit(X_scaled, y)
+                beta_init = model.coef_
+        
+        # Compute adaptive weights: wⱼ = 1/|βⱼ|^γ
+        # Add small constant to avoid division by zero
+        epsilon = 1e-6
+        weights = 1.0 / (np.abs(beta_init) + epsilon) ** self.gamma
+        
+        return weights
+    
+    def fit(self, y: pd.Series, X: pd.DataFrame):
+        """
+        Rolling Adaptive Lasso estimation
+        
+        At each date t:
+        1. Impute missing values
+        2. Get initial coefficients (Ridge/Lasso/OLS)
+        3. Compute adaptive weights
+        4. Fit weighted Lasso (manually via coordinate descent)
+        """
+        from sklearn.preprocessing import StandardScaler
+        
+        if len(y) != len(X):
+            raise ValueError(f"y and X must have same length")
+        if self.window >= len(y):
+            raise ValueError(f"window must be < data length")
+        
+        df = pd.concat([y.rename("y"), X], axis=1)
+        y_al = df["y"]
+        X_al = df.drop(columns=["y"])
+        T = len(df)
+        
+        y_pred_list = []
+        y_true_list = []
+        dates_list = []
+        has_missing_list = []
+        n_nonzero_list = []
+        coefs_list = [] if self.store_coefs else None
+        weights_list = [] if self.store_coefs else None
+        
+        for t in range(self.window, T):
+            if self.verbose and t % 12 == 0:
+                print(f"Processing t={t}/{T} ({y_al.index[t].strftime('%Y-%m')})")
+            
+            X_train = X_al.iloc[t - self.window : t]
+            y_train = y_al.iloc[t - self.window : t]
+            X_test = X_al.iloc[[t]]
+            y_test = y_al.iloc[t]
+            
+            has_missing = self._has_missing(X_train) or self._has_missing(X_test)
+            has_missing_list.append(has_missing)
+            
+            try:
+                X_train_imputed, X_test_imputed = self._impute_data(X_train, X_test)
+            except Exception as e:
+                if self.verbose:
+                    print(f"  WARNING: Imputation failed at t={t}: {e}")
+                continue
+            
+            common_idx = y_train.index.intersection(X_train_imputed.index)
+            y_train_al = y_train.loc[common_idx]
+            X_train_al = X_train_imputed.loc[common_idx]
+            
+            if len(y_train_al) < 10:
+                if self.verbose:
+                    print(f"  WARNING: Only {len(y_train_al)} observations at t={t}")
+                continue
+            
+            # Standardize
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train_al.values)
+            
+            # STEP 1: Get adaptive weights
+            weights = self._get_initial_weights(X_train_scaled, y_train_al.values)
+            
+            # STEP 2: Fit Adaptive Lasso
+            # We use Lasso with scaled penalty: λ_adaptive,j = λ * wⱼ
+            # Sklearn doesn't support per-feature penalties directly,
+            # so we rescale features: X̃ⱼ = Xⱼ/wⱼ
+            X_train_weighted = X_train_scaled / weights
+            
+            adaptive_lasso = Lasso(
+                alpha=self.alpha,
+                fit_intercept=True,
+                max_iter=self.max_iter_lasso,
+                random_state=42
+            )
+            adaptive_lasso.fit(X_train_weighted, y_train_al.values)
+            
+            # Recover true coefficients: β̂_true = β̂_weighted / weights
+            coef_adaptive = adaptive_lasso.coef_ / weights
+            
+            # Predict
+            X_test_scaled = scaler.transform(X_test_imputed.values)
+            y_pred = adaptive_lasso.intercept_ + np.dot(X_test_scaled, coef_adaptive)[0]
+            
+            dates_list.append(y_al.index[t])
+            y_true_list.append(y_test)
+            y_pred_list.append(y_pred)
+            
+            n_nonzero = np.sum(np.abs(coef_adaptive) > 1e-8)
+            n_nonzero_list.append(n_nonzero)
+            
+            if self.store_coefs:
+                coef_dict = {'intercept': adaptive_lasso.intercept_}
+                coef_dict.update({col: c for col, c in zip(X_al.columns, coef_adaptive)})
+                coefs_list.append(coef_dict)
+                
+                weights_dict = {col: w for col, w in zip(X_al.columns, weights)}
+                weights_list.append(weights_dict)
+        
+        # Build results (same structure as RollingLasso)
+        
+        dates_idx = pd.DatetimeIndex(dates_list)
+        y_true = pd.Series(y_true_list, index=dates_idx, name="y_true")
+        y_pred = pd.Series(y_pred_list, index=dates_idx, name="y_pred")
+        err = y_true - y_pred
+        err.name = "error"
+        
+        rmse_cum = np.sqrt((err ** 2).expanding().mean())
+        rmse_cum.name = "rmse_cum"
+        
+        rmse_roll = None
+        if self.rmse_window is not None and self.rmse_window >= 2:
+            rmse_roll = np.sqrt((err ** 2).rolling(self.rmse_window).mean())
+            rmse_roll.name = f"rmse_roll_{self.rmse_window}"
+        
+        has_missing_series = pd.Series(has_missing_list, index=dates_idx, name="has_missing")
+        n_nonzero_series = pd.Series(n_nonzero_list, index=dates_idx, name="n_nonzero_coefs")
+        
+        coefs_df = None
+        if self.store_coefs:
+            coefs_df = pd.DataFrame(coefs_list, index=dates_idx)
+        
+        self.result_ = RollingLassoResult(
+            dates=dates_idx,
+            y_true=y_true,
+            y_pred=y_pred,
+            err=err,
+            rmse_cum=rmse_cum,
+            rmse_roll=rmse_roll,
+            coefficients=coefs_df,
+            has_missing_by_window=has_missing_series,
+            n_nonzero_coefs=n_nonzero_series
+        )
+        
+        # Store weights for analysis
+        if self.store_coefs:
+            self.weights_ = pd.DataFrame(weights_list, index=dates_idx)
+        
+        if self.verbose:
+            self._print_summary()
+        
+        return self.result_
+    
+    def _print_summary(self):
+        res = self.result_
+        print(f"\n{'='*70}")
+        print(f"ROLLING ADAPTIVE LASSO - SUMMARY")
+        print(f"{'='*70}")
+        print(f"Window size          : {self.window}")
+        print(f"Alpha                : {self.alpha}")
+        print(f"Gamma (weight power) : {self.gamma}")
+        print(f"Initial estimator    : {self.initial_estimator}")
+        print(f"N° of predictions    : {len(res.dates)}")
+        print(f"\nVariable selection:")
+        print(f"  Mean n° non-zero   : {res.n_nonzero_coefs.mean():.1f}")
+        print(f"  Std n° non-zero    : {res.n_nonzero_coefs.std():.1f}")
+        print(f"  Min - Max          : {res.n_nonzero_coefs.min()} - {res.n_nonzero_coefs.max()}")
+        print(f"\nPerformance (out-of-sample):")
+        print(f"  Final RMSE (cum)   : {res.rmse_cum.iloc[-1]:.4f}")
+        print(f"  Mean absolute error: {res.err.abs().mean():.4f}")
+        print(f"  Std of errors      : {res.err.std():.4f}")
+        print(f"{'='*70}\n")
+    
+    def predict(self) -> pd.Series:
+        if self.result_ is None:
+            raise ValueError("Must call fit() before predict()")
+        return self.result_.y_pred
+
+"""
+Group Lasso for Rolling Window
+================================
+
+Group Lasso pénalise des groupes de variables ensemble.
+Utile quand certaines variables doivent être sélectionnées/retirées ensemble.
+
+Yuan, M., & Lin, Y. (2006). Model selection and estimation in regression 
+with grouped variables.
+
+Exemples d'utilisation:
+- Variables par pays (toutes les vars d'un pays ensemble)
+- Variables catégorielles (dummies d'une même catégorie)
+- Lags d'une variable (lag1, lag2, lag3 de la même série)
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from typing import Dict, List, Optional, Literal, Tuple
+from dataclasses import dataclass
+
+
+class RollingGroupLasso:
+    """
+    Group Lasso on rolling window with EM imputation
+    
+    Minimizes: ||y - Xβ||² + λ Σ_g √(|G_g|) ||β_g||₂
+    
+    where G_g is group g and ||β_g||₂ is the L2 norm of coefficients in group g.
+    
+    This encourages sparsity at the GROUP level (not individual variables).
+    """
+    
+    def __init__(
+        self,
+        window: int = 36,
+        alpha: float = 0.01,
+        groups: Optional[Dict[str, List[str]]] = None,  # {'group_name': ['var1', 'var2']}
+        imputation_method: Literal['em', 'median', 'forward_fill', 'none'] = 'em',
+        n_factors_imputation: int = 10,
+        max_iter: int = 1000,
+        max_iter_em: int = 50,
+        tol: float = 1e-4,
+        rmse_window: Optional[int] = 12,
+        store_coefs: bool = False,
+        verbose: bool = True,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        groups : dict
+            Dictionary mapping group names to list of variable names.
+            Example: {
+                'price_indices': ['IPCAG_EA', 'IPCOG_EA', 'IPICAG_EA'],
+                'stock_markets': ['DAX', 'CAC40', 'FTSE_MIB'],
+                'monetary': ['M1_EACC', 'M2_EACC']
+            }
+            If None, each variable is its own group (= standard Lasso)
+        alpha : float
+            Overall regularization strength
+        """
+        self.window = window
+        self.alpha = alpha
+        self.groups = groups
+        self.imputation_method = imputation_method
+        self.n_factors_imputation = n_factors_imputation
+        self.max_iter = max_iter
+        self.max_iter_em = max_iter_em
+        self.tol = tol
+        self.rmse_window = rmse_window
+        self.store_coefs = store_coefs
+        self.verbose = verbose
+        self.result_ = None
+        
+    def _has_missing(self, X: pd.DataFrame) -> bool:
+        return X.isna().any().any()
+    
+    def _impute_em(self, X: pd.DataFrame) -> Tuple[pd.DataFrame, object]:
+        empca = EM_PCA(
+            kmax=self.n_factors_imputation,
+            criterion='IC2',
+            demean=2,
+            max_iter=self.max_iter_em,
+            verbose=False,
+            fallback_n_factors=min(3, self.n_factors_imputation)
+        )
+        result = empca.fit(X)
+        return result.imputed_data, empca
+    
+    def _impute_data(
+        self, 
+        X_train: pd.DataFrame, 
+        X_test: Optional[pd.DataFrame] = None
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        has_missing_train = self._has_missing(X_train)
+        has_missing_test = X_test is not None and self._has_missing(X_test)
+        
+        if self.imputation_method == 'none':
+            if has_missing_train or has_missing_test:
+                raise ValueError("Missing values detected")
+            return X_train, X_test
+        
+        if not has_missing_train:
+            X_train_imputed = X_train.copy()
+            empca_model = None
+        else:
+            if self.imputation_method == 'em':
+                X_train_imputed, empca_model = self._impute_em(X_train)
+            elif self.imputation_method == 'median':
+                X_train_imputed = X_train.fillna(X_train.median())
+                empca_model = None
+            elif self.imputation_method == 'forward_fill':
+                X_train_imputed = X_train.ffill().fillna(X_train.median())
+                empca_model = None
+        
+        if X_test is None or not has_missing_test:
+            X_test_imputed = X_test
+        else:
+            if self.imputation_method == 'em' and empca_model is not None:
+                F_oos, X_test_imp = empca_model.transform(X_test, em=True, return_imputed=True)
+                X_test_imputed = X_test_imp
+            elif self.imputation_method == 'median':
+                X_test_imputed = X_test.fillna(X_train.median())
+            elif self.imputation_method == 'forward_fill':
+                X_test_imputed = X_test.ffill().fillna(X_train.median())
+        
+        return X_train_imputed, X_test_imputed
+    
+    def _setup_groups(self, feature_names: List[str]) -> Dict[str, List[int]]:
+        """
+        Convert group definitions to indices
+        
+        Returns
+        -------
+        group_indices : dict
+            {'group_name': [idx1, idx2, ...]}
+        """
+        if self.groups is None:
+            # Each variable is its own group (standard Lasso)
+            return {var: [i] for i, var in enumerate(feature_names)}
+        
+        # Map variable names to indices
+        name_to_idx = {name: i for i, name in enumerate(feature_names)}
+        group_indices = {}
+        
+        for group_name, var_names in self.groups.items():
+            indices = []
+            for var in var_names:
+                if var in name_to_idx:
+                    indices.append(name_to_idx[var])
+                elif self.verbose:
+                    print(f"  WARNING: Variable '{var}' in group '{group_name}' not found")
+            if indices:
+                group_indices[group_name] = indices
+        
+        # Add ungrouped variables as singleton groups
+        grouped_indices = set()
+        for indices in group_indices.values():
+            grouped_indices.update(indices)
+        
+        for i, name in enumerate(feature_names):
+            if i not in grouped_indices:
+                group_indices[f"_singleton_{name}"] = [i]
+        
+        return group_indices
+    
+    def _fit_group_lasso(
+        self, 
+        X: np.ndarray, 
+        y: np.ndarray,
+        group_indices: Dict[str, List[int]]
+    ) -> np.ndarray:
+        """
+        Fit Group Lasso via block coordinate descent
+        
+        Minimizes: ||y - Xβ||² + λ Σ_g √|G_g| ||β_g||₂
+        
+        Returns
+        -------
+        beta : np.ndarray (p,)
+        """
+        n, p = X.shape
+        beta = np.zeros(p)
+        
+        # Precompute X'X and X'y
+        XtX = X.T @ X
+        Xty = X.T @ y
+        
+        for iteration in range(self.max_iter):
+            beta_old = beta.copy()
+            
+            # Update each group
+            for group_name, group_idx in group_indices.items():
+                group_idx = np.array(group_idx)
+                
+                # Partial residual
+                r = y - X @ beta + X[:, group_idx] @ beta[group_idx]
+                
+                # Group update
+                z = X[:, group_idx].T @ r  # Gradient term
+                
+                # Soft-thresholding for group
+                z_norm = np.linalg.norm(z)
+                group_size = len(group_idx)
+                threshold = self.alpha * np.sqrt(group_size)
+                
+                if z_norm <= threshold:
+                    # Shrink entire group to zero
+                    beta[group_idx] = 0
+                else:
+                    # Block soft-thresholding
+                    # Solve: ||y - X_g β_g||² + λ√|G| ||β_g||₂
+                    # Solution: β_g = (1 - λ√|G|/||z||) * (X_g'X_g)^{-1} z
+                    
+                    XgXg = XtX[np.ix_(group_idx, group_idx)]
+                    try:
+                        beta_g = np.linalg.solve(XgXg + 1e-6 * np.eye(group_size), z)
+                        beta_g = beta_g * (1 - threshold / z_norm)
+                        beta[group_idx] = beta_g
+                    except np.linalg.LinAlgError:
+                        beta[group_idx] = 0
+            
+            # Check convergence
+            if np.linalg.norm(beta - beta_old) < self.tol:
+                break
+        
+        return beta
+    
+    def fit(self, y: pd.Series, X: pd.DataFrame):
+        """
+        Rolling Group Lasso estimation
+        """
+        if len(y) != len(X):
+            raise ValueError("y and X must have same length")
+        if self.window >= len(y):
+            raise ValueError("window must be < data length")
+        
+        df = pd.concat([y.rename("y"), X], axis=1)
+        y_al = df["y"]
+        X_al = df.drop(columns=["y"])
+        T = len(df)
+        
+        y_pred_list = []
+        y_true_list = []
+        dates_list = []
+        has_missing_list = []
+        n_nonzero_list = []
+        n_active_groups_list = []
+        coefs_list = [] if self.store_coefs else None
+        
+        for t in range(self.window, T):
+            if self.verbose and t % 12 == 0:
+                print(f"Processing t={t}/{T} ({y_al.index[t].strftime('%Y-%m')})")
+            
+            X_train = X_al.iloc[t - self.window : t]
+            y_train = y_al.iloc[t - self.window : t]
+            X_test = X_al.iloc[[t]]
+            y_test = y_al.iloc[t]
+            
+            has_missing = self._has_missing(X_train) or self._has_missing(X_test)
+            has_missing_list.append(has_missing)
+            
+            try:
+                X_train_imputed, X_test_imputed = self._impute_data(X_train, X_test)
+            except Exception as e:
+                if self.verbose:
+                    print(f"  WARNING: Imputation failed at t={t}: {e}")
+                continue
+            
+            common_idx = y_train.index.intersection(X_train_imputed.index)
+            y_train_al = y_train.loc[common_idx]
+            X_train_al = X_train_imputed.loc[common_idx]
+            
+            if len(y_train_al) < 10:
+                continue
+            
+            # Standardize
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train_al.values)
+            
+            # Setup groups
+            group_indices = self._setup_groups(list(X_train_al.columns))
+            
+            # Fit Group Lasso
+            beta = self._fit_group_lasso(
+                X_train_scaled, 
+                y_train_al.values,
+                group_indices
+            )
+            
+            # Intercept (mean of y)
+            intercept = y_train_al.mean()
+            
+            # Predict
+            X_test_scaled = scaler.transform(X_test_imputed.values)
+            y_pred = intercept + np.dot(X_test_scaled, beta)[0]
+            
+            dates_list.append(y_al.index[t])
+            y_true_list.append(y_test)
+            y_pred_list.append(y_pred)
+            
+            n_nonzero = np.sum(np.abs(beta) > 1e-8)
+            n_nonzero_list.append(n_nonzero)
+            
+            # Count active groups
+            n_active_groups = sum(
+                1 for group_idx in group_indices.values()
+                if np.any(np.abs(beta[group_idx]) > 1e-8)
+            )
+            n_active_groups_list.append(n_active_groups)
+            
+            if self.store_coefs:
+                coef_dict = {'intercept': intercept}
+                coef_dict.update({col: c for col, c in zip(X_al.columns, beta)})
+                coefs_list.append(coef_dict)
+        
+        # Build results
+        
+        dates_idx = pd.DatetimeIndex(dates_list)
+        y_true = pd.Series(y_true_list, index=dates_idx, name="y_true")
+        y_pred = pd.Series(y_pred_list, index=dates_idx, name="y_pred")
+        err = y_true - y_pred
+        err.name = "error"
+        
+        rmse_cum = np.sqrt((err ** 2).expanding().mean())
+        rmse_cum.name = "rmse_cum"
+        
+        rmse_roll = None
+        if self.rmse_window is not None and self.rmse_window >= 2:
+            rmse_roll = np.sqrt((err ** 2).rolling(self.rmse_window).mean())
+            rmse_roll.name = f"rmse_roll_{self.rmse_window}"
+        
+        has_missing_series = pd.Series(has_missing_list, index=dates_idx, name="has_missing")
+        n_nonzero_series = pd.Series(n_nonzero_list, index=dates_idx, name="n_nonzero_coefs")
+        
+        coefs_df = None
+        if self.store_coefs:
+            coefs_df = pd.DataFrame(coefs_list, index=dates_idx)
+        
+        self.result_ = RollingLassoResult(
+            dates=dates_idx,
+            y_true=y_true,
+            y_pred=y_pred,
+            err=err,
+            rmse_cum=rmse_cum,
+            rmse_roll=rmse_roll,
+            coefficients=coefs_df,
+            has_missing_by_window=has_missing_series,
+            n_nonzero_coefs=n_nonzero_series
+        )
+        
+        # Store group statistics
+        self.n_active_groups_ = pd.Series(n_active_groups_list, index=dates_idx, name="n_active_groups")
+        
+        if self.verbose:
+            self._print_summary()
+        
+        return self.result_
+    
+    def _print_summary(self):
+        res = self.result_
+        n_groups = len(self.groups) if self.groups else res.n_nonzero_coefs.mean()
+        print(f"\n{'='*70}")
+        print(f"ROLLING GROUP LASSO - SUMMARY")
+        print(f"{'='*70}")
+        print(f"Window size          : {self.window}")
+        print(f"Alpha                : {self.alpha}")
+        print(f"Number of groups     : {n_groups}")
+        print(f"N° of predictions    : {len(res.dates)}")
+        print(f"\nVariable selection:")
+        print(f"  Mean n° non-zero vars   : {res.n_nonzero_coefs.mean():.1f}")
+        print(f"  Mean n° active groups   : {self.n_active_groups_.mean():.1f}")
+        print(f"\nPerformance (out-of-sample):")
+        print(f"  Final RMSE (cum)   : {res.rmse_cum.iloc[-1]:.4f}")
+        print(f"  Mean absolute error: {res.err.abs().mean():.4f}")
+        print(f"{'='*70}\n")
+
+
+
+def plot_rolling_results(result: RollingLassoResult, figsize=(14, 12)):
+    fig, axes = plt.subplots(5, 1, figsize=figsize)
+    
+    # 1. RMSE
+    ax = axes[0]
+    result.rmse_cum.plot(ax=ax, label="Cumulative RMSE", linewidth=2, color='tab:blue')
+    if result.rmse_roll is not None:
+        result.rmse_roll.plot(
+            ax=ax, 
+            label=f"RMSE rolling ({result.rmse_roll.name})",
+            linestyle="--", 
+            alpha=0.8,
+            color='tab:orange'
+        )
+    ax.set_title("Out-of-Sample RMSE", fontsize=13, fontweight='bold')
+    ax.set_ylabel("RMSE")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    
+    # 2. Predictions vs true values
+    ax = axes[1]
+    result.y_true.plot(ax=ax, label="Observed", alpha=0.7, linewidth=1.5, color='black')
+    result.y_pred.plot(ax=ax, label="Predicted", alpha=0.8, linewidth=1.5, color='tab:red')
+    ax.set_title("Predictions vs Observed Values", fontsize=13, fontweight='bold')
+    ax.set_ylabel("y")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    
+    # 3. Prediction errors
+    ax = axes[2]
+    result.err.plot(ax=ax, label="Prediction error", color="tab:red", alpha=0.7)
+    ax.axhline(0, color="black", linewidth=1, linestyle='--')
+    ax.fill_between(result.err.index, 0, result.err.values, alpha=0.2, color='tab:red')
+    ax.set_title("Prediction Errors", fontsize=13, fontweight='bold')
+    ax.set_ylabel("Error")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    
+    # 4. Number of non-zero coefficients (sparsity)
+    ax = axes[3]
+    result.n_nonzero_coefs.plot(ax=ax, marker='o', linestyle='-', markersize=3, color='tab:green')
+    ax.axhline(result.n_nonzero_coefs.mean(), color='red', linestyle='--', 
+               label=f'Mean: {result.n_nonzero_coefs.mean():.1f}')
+    ax.set_title("Number of Non-Zero Coefficients (Variable Selection)", fontsize=13, fontweight='bold')
+    ax.set_ylabel("N° non-zero coefs")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    
+    # 5. Missing data indicator
+    ax = axes[4]
+    result.has_missing_by_window.astype(int).plot(ax=ax, marker='|', linestyle='', 
+                                                   markersize=10, color='tab:purple')
+    ax.set_title("Windows with Missing Values", fontsize=13, fontweight='bold')
+    ax.set_ylabel("Has missing (1/0)")
+    ax.set_xlabel("Date")
+    ax.set_ylim([-0.1, 1.1])
+    ax.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    return fig, axes
