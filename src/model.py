@@ -1,18 +1,27 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.linear_model import RidgeCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.base import clone
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+
 
 class Model(ABC):
     """
     Abstract class to store the econometrics and machine learning
     models we will estimate as part of this project
     """
+    @abstractmethod
+    def __init__(self, y, x):
+        pass
 
     @abstractmethod
-    def model_estimate(self, y, x, window):
+    def model_estimate(self, window):
         """
         Method to estimate a model using a rolling window
         :param y: variable to estimate
@@ -22,7 +31,7 @@ class Model(ABC):
         """
         pass
     @abstractmethod
-    def predict_model(self, y, x):
+    def predict_model(self):
         """
         method to predict the results from the model out-sample
         :param y:
@@ -589,8 +598,70 @@ class RollingRegression:
 
     # Class for factor model
 
-    # Class for ridge model
+# Class for ridge model
+class RidgeMod:
+    def __init__(self, y: pd.Series, x:pd.DataFrame, state:int):
+        self.y: pd.Series = y
+        self.x: pd.DataFrame = x
+        self.state: int = state
+        self.results:tuple = None
+        
+    def model_estimate(self, window: int, alphas: tuple, n_splits: int):
+        """
+        Estimation of a ridge regression approach following a rolling window
+        framework
+        :param self: Description
+        :param window: Description
+         """
 
-    # Class for group ridge model
+        # First: impute missing values using EM algorithm (to adapt)
+
+        # We compute the number of periods of our sample
+        t: int = self.y.shape[0]
+
+        # Results to retrieve
+        dates, const, betas, fitted = [], [], [], []
+
+        # Model configuration (can be generalized to elastic net and lasso)
+        model_pipeline = Pipeline([
+            ('scaler',StandardScaler()),
+            ('model', RidgeCV(alphas = alphas,
+                                  fit_intercept=True,
+                                  cv = TimeSeriesSplit(n_splits = n_splits)))
+        ])
+
+        # For loop to estimate the model over
+        for i in range(window, t):
+
+            
+            print(type(self.x), self.x.shape)
+            print(type(self.y), self.y.shape)
+
+            # Select all the available information for the forecast
+            y_train = self.y.iloc[i-window:i]
+            x_train = self.x.iloc[i-window:i, :]
+
+            # Estimation of the model with cross validation respecting the linear dependence (clone such that we estimate a new model on each iteration)
+            ridge_model = clone(model_pipeline)
+            ridge_model.fit(x_train, y_train)
+
+            # Prediction at time t for y
+            x_oos = self.x.iloc[i].values  
+            y_pred = ridge_model.named_steps["model"].intercept_ + np.dot(x_oos, ridge_model.named_steps["model"].coef_)
+
+            # We retrieve the coefficients associated with the variables
+            dates.append(self.y.index[i])
+            const.append(ridge_model.named_steps["model"].intercept_)
+            betas.append(ridge_model.named_steps["model"].coef_)
+            fitted.append(y_pred)
+
+            # Prediction for a given horizon
+
+            # Store the performance metrics in the result
+
+        # Retrieve the residuals
+        self.results = (dates, const, betas, fitted)
+
+        # Method to perform the model prediction
 
     # Class for random forest model

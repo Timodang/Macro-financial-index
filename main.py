@@ -3,13 +3,12 @@
 
 import numpy as np
 import pandas as pd
-import datetime
-import scipy.stats
 import matplotlib.pyplot as plt
-import sklearn as sk
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+
+
 
 """
 Functions block
