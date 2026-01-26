@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Lasso, Ridge, ElasticNet
+from sklearn.ensemble import RandomForestRegressor
 
 class Model(ABC):
     """
@@ -628,7 +629,7 @@ class RollingRegression:
     """
     Implements rolling linear regression.
     """
-    def __init__(self, y: pd.Series, X: pd.DataFrame, window: int) -> None:
+    def __init__(self, y: pd.Series, X: pd.DataFrame, window: int, type_window:str = "rolling") -> None:
         """
         Parameters:
         -----------
@@ -650,6 +651,7 @@ class RollingRegression:
         self.window = window
         self.T = len(y)
         self.result_ = None
+        self.type_window: str = type_window
     
     def fit(self) -> RollingRegressionResult:
         """
@@ -660,11 +662,19 @@ class RollingRegression:
         RollingRegressionResult with dates, coefficients, predictions, R²
         """
         dates, alphas, betas, fitted, r2s = [], [], [], [], []
+
+        # case the window chosen is not rolling or expanding
+        if self.type_window != "rolling" and self.type_window != "expanding":
+            raise ValueError(f"The rolling regression for a {self.type_window} window is not implemented")
         
         for t in range(self.window, self.T):
-            # Training window
-            y_window = self.y.iloc[t - self.window : t]
-            X_window = self.X.iloc[t - self.window : t]
+            # case for a rolling window
+            if self.type_window == "rolling":
+                y_window = self.y.iloc[t - self.window : t]
+                X_window = self.X.iloc[t - self.window : t]
+            else:
+                y_window = self.y.iloc[0:t]
+                X_window = self.X.iloc[0:t]
 
             # Add constant and fit
             X_window_c = sm.add_constant(X_window)
@@ -678,8 +688,8 @@ class RollingRegression:
 
             # Store results
             dates.append(self.y.index[t])
-            alphas.append(model.params[0])
-            betas.append(model.params[1:].values)
+            alphas.append(model.params.iloc[0])
+            betas.append(model.params.iloc[1:].values)
             fitted.append(y_pred)
             r2s.append(model.rsquared)
         
@@ -2320,3 +2330,301 @@ def plot_rolling_results(result: RollingLassoResult, figsize=(14, 12)):
     
     plt.tight_layout()
     return fig, axes
+
+class TargetRandomForest:
+    """
+    Random Forest on a rolling or expanding window with EM imputation
+    """
+    
+    def __init__(
+        self,
+        window: int = 36,
+        type_window: str = "rolling",
+        alpha: float = 1,
+        n_estimators: int = 100, # Number of trees for the forest
+        criterion: Literal["squared_error", "absolute_error", "friedman_mse", "poisson"] = "squared_error", # Function to measure the quality of a split
+        max_depth: int = None,
+        min_sample_split: int = 2,
+        min_sample_leaf: int = 1,
+        imputation_method: Literal['em', 'median', 'forward_fill', 'none'] = 'em',
+        n_factors_imputation: int = 10,
+        max_iter_em: int = 50,
+        max_iter: int = 1000,
+        rmse_window: Optional[int] = 12,
+        store_coefs: bool = False,
+        verbose: bool = True,
+    ) -> None:
+        """
+        Parameters:
+        -----------
+        - window       : int
+            Length of the rolling window in months
+        - imputation_method : str
+            Method to use to replace missing value (should be em)
+        - n_factors_imputation : int
+            Number of factors to use for EM replacement
+        - max_iter_em : int
+            Maximum number of iterations for the EM algorithm
+        - rmse_window : int 
+            Window to use for the computation of the rolling RMSE
+        - store_coefs : bool
+            True if rolling coefficients have to be stored
+        - verbose : bool
+            True if extensive user log should be printed  
+        """
+        self.window = window
+        self.type_window = type_window
+        self.alpha = alpha
+        self.n_estimators = n_estimators
+        self.criterion = criterion
+        self.max_depth = max_depth
+        self.min_sample_split = min_sample_split
+        self.min_sample_leaf = min_sample_leaf
+        self.imputation_method = imputation_method
+        self.n_factors_imputation = n_factors_imputation
+        self.max_iter_em = max_iter_em
+        self.max_iter = max_iter
+        self.rmse_window = rmse_window
+        self.store_coefs = store_coefs
+        self.verbose = verbose
+        self.result_: Optional[RollingLassoResult] = None
+        
+    def _has_missing(self, X: pd.DataFrame) -> bool:
+        return X.isna().any().any()
+    
+    def _impute_median(self, X: pd.DataFrame) -> pd.DataFrame:
+        return X.fillna(X.median())
+    
+    def _impute_forward_fill(self, X: pd.DataFrame) -> pd.DataFrame:
+        X_filled = X.ffill()
+        return X_filled.fillna(X_filled.median())
+    
+    def _impute_em(self, X: pd.DataFrame) -> Tuple[pd.DataFrame, object]:
+        empca = EM_PCA(
+            kmax=self.n_factors_imputation,
+            criterion='IC2',
+            demean=2,
+            max_iter=self.max_iter_em,
+            verbose=False,
+            fallback_n_factors=min(3, self.n_factors_imputation)
+        )
+        result = empca.fit(X)
+        return result.imputed_data, empca
+    
+    def _impute_data(
+        self, 
+        X_train: pd.DataFrame, 
+        X_test: Optional[pd.DataFrame] = None
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        has_missing_train = self._has_missing(X_train)
+        has_missing_test = X_test is not None and self._has_missing(X_test)
+        
+        if self.imputation_method == 'none':
+            if has_missing_train or has_missing_test:
+                raise ValueError("Missing values detected but imputation_method='none'")
+            return X_train, X_test
+        
+        if not has_missing_train:
+            X_train_imputed = X_train.copy()
+            empca_model = None
+        else:
+            if self.imputation_method == 'em':
+                X_train_imputed, empca_model = self._impute_em(X_train)
+            elif self.imputation_method == 'median':
+                X_train_imputed = self._impute_median(X_train)
+                empca_model = None
+            elif self.imputation_method == 'forward_fill':
+                X_train_imputed = self._impute_forward_fill(X_train)
+                empca_model = None
+        
+        if X_test is None or not has_missing_test:
+            X_test_imputed = X_test
+        else:
+            if self.imputation_method == 'em' and empca_model is not None:
+                _, X_test_imp = empca_model.transform(X_test, em=True, return_imputed=True)
+                X_test_imputed = X_test_imp
+            elif self.imputation_method == 'median':
+                X_test_imputed = X_test.fillna(X_train.median())
+            elif self.imputation_method == 'forward_fill':
+                X_test_imputed = X_test.ffill()
+                X_test_imputed = X_test_imputed.fillna(X_train.median())
+        
+        return X_train_imputed, X_test_imputed
+    
+    def fit(self, y: pd.Series, X: pd.DataFrame, threshold: float = 1e-6) -> RollingLassoResult:
+        """
+        Run RF on a rolling or expanding window basis
+        """
+        if len(y) != len(X):
+            raise ValueError(f"y and X must have same length: {len(y)} != {len(X)}")
+        if self.window >= len(y):
+            raise ValueError(f"window ({self.window}) must be < data length ({len(y)})")
+        
+        if self.type_window != "rolling" and self.type_window != "expanding":
+            raise ValueError(f"The choice of the window {self.type_window} is not implemented for this function")
+        
+        df = pd.concat([y.rename("y"), X], axis=1)
+        y_al = df["y"]
+        X_al = df.drop(columns=["y"])
+        T = len(df)
+        
+        y_pred_list = []
+        y_true_list = []
+        dates_list = []
+        has_missing_list = []
+        n_nonzero_list = []
+        coefs_list = [] if self.store_coefs else None
+        
+        for t in range(self.window, T):
+            if self.verbose and t % 12 == 0:
+                print(f"Processing t={t}/{T} ({y_al.index[t].strftime('%Y-%m')})")
+            
+            if self.type_window == "rolling":
+                X_train = X_al.iloc[t - self.window : t]
+                y_train = y_al.iloc[t - self.window : t]
+            else:
+                X_train = X_al.iloc[0 : t]
+                y_train = y_al.iloc[0 : t]
+
+            X_test = X_al.iloc[[t]]
+            y_test = y_al.iloc[t]
+            
+            # If there are missing values, we impute them 
+            has_missing = self._has_missing(X_train) or self._has_missing(X_test)
+            has_missing_list.append(has_missing)
+            try:
+                X_train_imputed, X_test_imputed = self._impute_data(X_train, X_test)
+            except Exception as e:
+                if self.verbose:
+                    print(f"  WARNING: Imputation failed at t={t}: {e}")
+                continue
+            
+            # We only keep predictors and dependent variables available on the same periods
+            common_idx = y_train.index.intersection(X_train_imputed.index)
+            y_train_al = y_train.loc[common_idx]
+            X_train_al = X_train_imputed.loc[common_idx]
+            
+            if len(y_train_al) < 10:
+                if self.verbose:
+                    print(f"  WARNING: Only {len(y_train_al)} observations at t={t}, skipping")
+                continue
+            
+            # Scaling of data before estimation
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train_al.values)
+            
+            ### First step - select the subset of regressors using a penalized reggression (Lasso for now, can be extended)
+            lasso = Lasso( # A checker: cross-val directement dans la boucle
+                alpha = self.alpha,
+                fit_intercept=True,
+                max_iter=self.max_iter,
+                random_state=42
+            )
+
+            lasso.fit(X_train_scaled, y_train_al.values)
+
+            # Once the Lasso is fit, we only keep predictors for which the coefficients is large enough
+            selected = np.abs(lasso.coef_) > threshold
+            X_train_scaled = X_train_scaled[:, selected]
+            if X_train_scaled.shape[1] == 0:
+                if self.verbose:
+                    print(f"No variables selected for time t = {t}")
+                continue
+
+            ### Second step - Estimate the Random forest on this subset of predictors
+            rf = RandomForestRegressor(
+                n_estimators = self.n_estimators, 
+                criterion=self.criterion,
+                max_depth=self.max_depth,
+                min_samples_split=self.min_sample_split,
+                min_samples_leaf=self.min_sample_leaf,
+                random_state=42
+            )
+
+            rf.fit(X_train_scaled, y_train_al.values)
+
+            # We compute predicted values for the set of predictors selected by Lasso / EN, ...
+            X_test_scaled = pd.DataFrame(
+                scaler.transform(X_test_imputed.values),
+                columns = X_test_imputed.columns,
+                index = X_test_imputed.index
+            )
+            X_test_scaled = X_test_scaled.loc[:,selected].values
+
+            # We make the prediction and retrieve the results
+            y_pred = rf.predict(X_test_scaled)[0]
+            dates_list.append(y_al.index[t])
+            y_true_list.append(y_test)
+            y_pred_list.append(y_pred)
+
+            ### Third step - use shape to build the index
+
+
+            
+            # Ridge ne fait PAS de sélection de variables (tous les coefs ≠ 0)
+            if self.store_coefs:
+                coef_dict = {'intercept': 0}
+                #coef_dict.update({col: coef for col, coef in zip(X_al.columns, ridge.coef_)})
+                coefs_list.append(coef_dict)
+        
+        dates_idx = pd.DatetimeIndex(dates_list)
+        y_true = pd.Series(y_true_list, index=dates_idx, name="y_true")
+        y_pred = pd.Series(y_pred_list, index=dates_idx, name="y_pred")
+        err = y_true - y_pred
+        err.name = "error"
+        
+        rmse_cum = np.sqrt((err ** 2).expanding().mean())
+        rmse_cum.name = "rmse_cum"
+        
+        rmse_roll = None
+        if self.rmse_window is not None and self.rmse_window >= 2:
+            rmse_roll = np.sqrt((err ** 2).rolling(self.rmse_window).mean())
+            rmse_roll.name = f"rmse_roll_{self.rmse_window}"
+        
+        has_missing_series = pd.Series(has_missing_list, index=dates_idx, name="has_missing")
+        #n_nonzero_series = pd.Series(n_nonzero_list, index=dates_idx, name="n_nonzero_coefs")
+        
+        coefs_df = None
+        if self.store_coefs:
+            coefs_df = pd.DataFrame(coefs_list, index=dates_idx)
+        
+        self.result_ = RollingLassoResult(
+            dates=dates_idx,
+            y_true=y_true,
+            y_pred=y_pred,
+            err=err,
+            rmse_cum=rmse_cum,
+            rmse_roll=rmse_roll,
+            coefficients=coefs_df,
+            has_missing_by_window=has_missing_series,
+            n_nonzero_coefs=None
+        )
+        
+        if self.verbose:
+            self._print_summary()
+        
+        return self.result_
+    
+    def _print_summary(self):
+        res = self.result_
+        print(f"\n{'='*70}")
+        print(f"ROLLING TRF WITH EM IMPUTATION - SUMMARY")
+        print(f"{'='*70}")
+        print(f"Window size          : {self.window}")
+        print(f"Alpha (Ridge)        : {self.alpha}")
+        print(f"Imputation method    : {self.imputation_method}")
+        print(f"N° of predictions    : {len(res.dates)}")
+        print(f"\nCoefficient statistics:")
+        print(f"\nMissing data:")
+        pct_missing = 100 * res.has_missing_by_window.sum() / len(res.has_missing_by_window)
+        print(f"  Windows with missing: {pct_missing:.1f}% ({res.has_missing_by_window.sum()} / {len(res.dates)})")
+        print(f"\nPerformance (out-of-sample):")
+        print(f"  Final RMSE (cum)   : {res.rmse_cum.iloc[-1]:.4f}")
+        print(f"  Mean absolute error: {res.err.abs().mean():.4f}")
+        print(f"  Std of errors      : {res.err.std():.4f}")
+        print(f"{'='*70}\n")
+    
+    def predict(self) -> pd.Series:
+        if self.result_ is None:
+            raise ValueError("Must call fit() before predict()")
+        return self.result_.y_pred
