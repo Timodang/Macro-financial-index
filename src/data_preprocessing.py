@@ -8,27 +8,6 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 Functions block
 """
 
-def lagmatrix(x:np.array, p:int)->np.array:
-    """
-    Function to build a lagmatrix 
-    :param x: array of data used to build the lagmatrix
-    :type x: np.array
-    :param p: number of lags
-    :type p: int
-    :return: Description
-    :rtype: Any
-    """
-    t = len(x)
-    lag_mat: list = []
-    if p < 0:
-        raise ValueError(f"The number of lags {p} must be positive to build a lag matrix")
-    if p > 0:
-        for i in range(p):
-            lag_mat.append(x[p - 1 - i : t - 1 - i])
-        return np.column_stack(lag_mat)
-    else:
-        return x
-
 def adf_reg(feature: pd.Series, p: int, regression: str):
     """
     Function to compute an ADF regression to estimate the trend and constant coefficient.
@@ -61,10 +40,8 @@ def adf_reg(feature: pd.Series, p: int, regression: str):
         for i in range(p):
             # Corrected indexing: use previous values (p-1-i) to explain current diff
             x_components.append(dy[p - 1 - i : t - 1 - i])
-    
+
     x = np.column_stack(x_components)
-    # lag_mat:np.array = lagmatrix(dy, p)
-    # x = np.concatenate((np.column_stack(x_components), lag_mat), axis = 1)
 
     # Dependent variable adjusted for lags
     dy_dependent = dy[p:]
